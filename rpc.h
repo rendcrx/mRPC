@@ -1,5 +1,5 @@
-#ifndef __RPC_SERVER_H__
-#define __RPC_SERVER_H__
+#ifndef __RPC_H__
+#define __RPC_H__
 
 #ifdef __cplusplus
 extern "C" {
@@ -288,4 +288,4 @@ void rpc_server_destroy(void *rpc_shared_ptr, const char *shm_name)
 }
 #endif
 
-#endif // __RPC_SERVER_H__
+#endif /* __RPC_H__ */
