@@ -1,5 +1,5 @@
 #define RPC_CLIENT_IMPLEMENT
-#include "rpc.h"
+#include "../rpc.h"
 
 #include <assert.h>
 #include <stdio.h>
