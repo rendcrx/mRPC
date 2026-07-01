@@ -14,7 +14,7 @@ void  rpc_free(void *ptr);
 void  rpc_client_destroy(void *rpc_server_ptr);
 
 void *rpc_server_init(const char *shm_name);
-void  rpc_server_func_register(const char *func_name, void *func_ptr);
+void  rpc_server_func_register(const char *func_name, int (*func_ptr)(void));
 void  rpc_server_run(void *rpc_shared_ptr);
 void  rpc_server_destroy(void *rpc_shared_ptr, const char *shm_name);
 
@@ -142,29 +142,29 @@ void rpc_client_destroy(void *rpc_server_ptr)
 #define RPC_CALL_ARGS6(stack) (((struct _rpc_stack *)(stack))->data[6])
 #define RPC_CALL_PUSH_VALUE(stack, value) (((struct _rpc_stack *)(stack))->data[0] = (void *)(value))
 
-#define RPC_SERVER_POP_POINTER(stack)								\
-	({                                                                              	\
-		 void *ret = NULL;                                                      	\
-		 if ((stack)->top <= 0)                                                 	\
-			 (stack)->state = ERR_ARGSNO;                                   	\
-		 else                                                                   	\
-			 ret = (ptrdiff_t)((stack)->data[--(stack)->top]) + (void *)stack;	\
-		 ret;										\
+#define RPC_SERVER_POP_POINTER(stack)									\
+	({                                                                              		\
+		 void *ret = NULL;                                                      		\
+		 if ((stack)->top <= 0)                                                 		\
+			 (stack)->state = ERR_ARGSNO;                                   		\
+		 else                                                                   		\
+			 ret = (void *)((ptrdiff_t)((stack)->data[--(stack)->top]) + (ptrdiff_t)stack);	\
+		 ret;											\
 	 })
 
-#define RPC_SERVER_POP(stack)									\
-	({                                                   					\
-		void *ret = NULL;                            					\
-		if ((stack)->top <= 0)                       					\
-			(stack)->state = ERR_ARGSNO;         					\
-		else                                         					\
-			ret = (stack)->data[--(stack)->top];					\
-		ret;                                            				\
+#define RPC_SERVER_POP(stack)										\
+	({                                                   						\
+		void *ret = NULL;                            						\
+		if ((stack)->top <= 0)                       						\
+			(stack)->state = ERR_ARGSNO;         						\
+		else                                         						\
+			ret = (stack)->data[--(stack)->top];						\
+		ret;                                            					\
 	})
 
 struct rpc_func_unit {
 	const char *func_name;
-	const void *func_ptr;
+	int (*func_ptr)(void);
 	uint32_t func_object;
 };
 
@@ -216,7 +216,7 @@ static uint32_t _func_object(const char *func_name)
 	return hash;
 }
 
-void rpc_server_func_register(const char *func_name, void *func_ptr)
+void rpc_server_func_register(const char *func_name, int (*func_ptr)(void))
 {
 	size_t size;
 	uint32_t object;
@@ -242,7 +242,7 @@ void rpc_server_func_register(const char *func_name, void *func_ptr)
 	unit->func_object = object;
 }
 
-static const void *_rpc_func_getptr(const char *func_name)
+static int (*_rpc_func_getptr(const char *func_name))(void)
 {
 	uint32_t object;
 	struct rpc_func_unit *unit;
@@ -258,11 +258,11 @@ static const void *_rpc_func_getptr(const char *func_name)
 
 void rpc_server_run(void *rpc_shared_ptr)
 {
-	int (*fn)();
+	int (*fn)(void);
 	struct _rpc_stack *stack = (struct _rpc_stack *)rpc_shared_ptr;
 	for (;;) {
 		while (stack->call_flag && RPC_STACK_STATE_NORMAL(stack)) {
-			fn = (int (*)())_rpc_func_getptr((const char *)RPC_SERVER_POP_POINTER(stack));
+			fn = _rpc_func_getptr((const char *)RPC_SERVER_POP_POINTER(stack));
 			if (fn) {
 				stack->errno = fn();
 				RPC_CLEAR_STACK_DATA(stack);

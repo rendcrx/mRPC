@@ -4,14 +4,13 @@
 #include <assert.h>
 #include <stdio.h>
 
-int main()
+int main(void)
 {
 	void *target = rpc_client_init("/test");
 	assert(target);
 
-	char *func = rpc_malloc(64);
+	char *func = (char *)rpc_malloc(64);
 	strcpy(func, "add");
-	printf("%p: %s\n", func, func);
 
 	RPC_CLIENT_PUSH(target, 1);
 	RPC_CLIENT_PUSH(target, 2);
