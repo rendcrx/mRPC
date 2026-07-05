@@ -6,18 +6,30 @@
 
 int main(void)
 {
-	void *target = rpc_client_init("/test");
-	assert(target);
+	handle_t handle = rpc_client_init("/test");
+	assert(handle);
 
-	char *func = (char *)rpc_malloc(64);
-	strcpy(func, "add");
+	void *ptr = rpc_alloc_page(handle);
+	assert(ptr);
+	
+	assert(rpc_push_value(handle, (void *)1) == 0);
+	assert(rpc_push_value(handle, (void *)2) == 0);
 
-	RPC_CLIENT_PUSH(target, 1);
-	RPC_CLIENT_PUSH(target, 2);
-	RPC_CLIENT_PUSH_POINTER(target, func);
+	char *str = (char *)ptr;
+	strcpy(str, "add");
 
-	rpc_client_call(target);
-	printf("%lld\n", (int64_t)RPC_GET_CALL_VALUE(target));
+	assert(rpc_push_pointer(handle, str) == 0);
 
-	rpc_client_destroy(target);
+	rpc_client_call(handle);
+
+	rpc_client_spin(handle);
+
+	void *ret;
+	assert(rpc_pop_value(handle, &ret) == 0);
+
+	assert(rpc_free(handle, ptr) == 0);
+
+	printf("%lld\n", (int64_t)ret);
+
+	rpc_client_destroy(handle);
 }

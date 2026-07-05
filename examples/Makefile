@@ -1,10 +1,10 @@
 all: client server
 
 client: client.c ../rpc.h
-	cc -o $@ $<
+	cc -g -o $@ $<
 
 server: server.c ../rpc.h
-	cc -o $@ $<
+	cc -g -o $@ $<
 
 clean:
 	rm -f client server

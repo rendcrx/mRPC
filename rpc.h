@@ -5,18 +5,36 @@
 extern "C" {
 #endif
 
-#include <stddef.h>
+typedef void *handle_t;
+typedef struct _rpc_funcs *funclist_t;
 
-void *rpc_client_init(const char *shm_name);
-void  rpc_client_call(void *rpc_server_ptr);
-void *rpc_malloc(size_t size);
-void  rpc_free(void *ptr);
-void  rpc_client_destroy(void *rpc_server_ptr);
+/* Client */
+handle_t  rpc_client_init(const char *shm_name);
+void     *rpc_alloc_page(handle_t handle);
+int       rpc_free(handle_t handle, void *ptr);
+void      rpc_client_call(handle_t handle);
+void      rpc_client_spin(handle_t);
+void      rpc_client_wait(handle_t);
+void      rpc_client_destroy(handle_t handle);
 
-void *rpc_server_init(const char *shm_name);
-void  rpc_server_func_register(const char *func_name, int (*func_ptr)(void));
-void  rpc_server_run(void *rpc_shared_ptr);
-void  rpc_server_destroy(void *rpc_shared_ptr, const char *shm_name);
+/* Server */
+handle_t  rpc_server_init(const char *shm_name, void (*handler)(handle_t));
+int       rpc_server_push_pointer(handle_t handle, void *v);
+int       rpc_server_pop_pointer(handle_t handle, void **v);
+void      rpc_server_return(handle_t handle);
+void      rpc_server_destroy(handle_t handle, const char *shm_name);
+
+/* Stack */
+int       rpc_push_value(handle_t handle, void *v);
+int       rpc_push_pointer(handle_t handle, void *v);
+int       rpc_pop_value(handle_t handle, void **r);
+int       rpc_pop_pointer(handle_t handle, void **r);
+
+/* Auxiliary */
+funclist_t rpcL_funclist_init();
+void       rpcL_funcregister(funclist_t funclist, const char *func_name, void (*func_ptr)(handle_t));
+void       (*rpcL_get_funcptr(funclist_t funclist, const char *func_name))(handle_t);
+void       rpcL_funclist_destroy(funclist_t funclist);
 
 #if defined(RPC_CLIENT_IMPLEMENT) || defined(RPC_SERVER_IMPLEMENT)
 
@@ -26,145 +44,429 @@ void  rpc_server_destroy(void *rpc_shared_ptr, const char *shm_name);
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdatomic.h>
 
-#define MAX_ARGS_COUNT 6 
-#define RPC_PAGE_SIZE 4096
+#define RPC_STACK_DEFAULT       6
+#define RPC_MEMO_SIZE           (4 * RPC_PAGE_SIZE)
+#define RPC_STACKS_SIZE         RPC_PAGE_SIZE
+#define RPC_PAGE_SIZE           4096
 
-enum _rpc_stack_state {
-	OK,
-	ERR_ARGSNO,
-	ERR_FUNCNAME,
-};
+#define RPC_STACK_VALID_IDLE    0
+#define RPC_STACK_VALID_WORK    1
+
+#define RPC_STACK_STATE_IDLE    0
+#define RPC_STACK_STATE_CALL    1
+#define RPC_STACK_STATE_ALLOC   2
+#define RPC_STACK_STATE_FREE    3
+#define RPC_STACK_STATE_RETURN  4
+#define RPC_STACK_STATE_PROCESS 5
 
 struct _rpc_stack {
-	int errno;
+	atomic_int valid;
+	void *origin_ptr;
+	int state;
 	int top;
-	int call_flag;
-	enum _rpc_stack_state state;
-	void *data[MAX_ARGS_COUNT+1];
+	void *stack[RPC_STACK_DEFAULT];
 };
 
-#define RPC_STATE_IS_NORMAL(ptr) (((struct _rpc_stack *)ptr)->state == OK)
-#define RPC_CALL_IS_NORMAL(ptr)  (((struct _rpc_stack *)ptr)->errno == 0)
-#define RPC_GET_CALL_VALUE(ptr)  (((struct _rpc_stack *)ptr)->data[0])
-
-static void *_rpc_shared_memory_pool;
-
-void _rpc_shared_memory_init(void *target)
+int rpc_push_value(handle_t handle, void *v)
 {
-	_rpc_shared_memory_pool = (void *)(((struct _rpc_stack *)target) + 1);
-	uint8_t *start = (uint8_t *)_rpc_shared_memory_pool;
-	uint8_t *end = (uint8_t *)target + RPC_PAGE_SIZE;
-	for (; start + 64 < end; start = start + 64)
-		*(void **)start = (void *)(start + 64);
-	*(void **)start = NULL;
-}
-
-void *rpc_malloc(size_t size)
-{
-	void *ret = NULL;
-	if (_rpc_shared_memory_pool) {
-		ret = _rpc_shared_memory_pool;
-		_rpc_shared_memory_pool = *(void **)_rpc_shared_memory_pool;
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->top >= RPC_STACK_DEFAULT)
+		return 1;
+	else {
+		s->stack[s->top++] = v;
+		return 0;
 	}
-	return ret;
 }
 
-void rpc_free(void *ptr)
+int rpc_push_pointer(handle_t handle, void *v)
 {
-	*(void **)ptr = _rpc_shared_memory_pool;
-	_rpc_shared_memory_pool = ptr;
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->top >= RPC_STACK_DEFAULT)
+		return 1;
+	else {
+		s->stack[s->top++] = (void *)((uintptr_t)v - (uintptr_t)s->origin_ptr);
+		return 0;
+	}
 }
 
-#endif
+int rpc_pop_value(handle_t handle, void **r)
+{
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->top <= 0)
+		return 1;
+	else {
+		*r = s->stack[--s->top];
+		return 0;
+	}
+}
+
+int rpc_pop_pointer(handle_t handle, void **r)
+{
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->top <= 0)
+		return 1;
+	else {
+		*r = (void *)((ptrdiff_t)(s->stack[--s->top]) + (uintptr_t)s->origin_ptr);
+		return 0;
+	}
+}
+
+#endif /* RPC_CLIENT_IMPLEMENT || RPC_SERVER_IMPLEMENT */
+
+#ifdef RPC_SERVER_IMPLEMENT
+
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+
+struct task_t {
+	void *arg;
+	void (*func)(handle_t);
+	struct task_t *next;
+};
+
+struct pthread_pool_t {
+	int stop;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	struct task_t *tasks_head;
+	struct task_t *tasks_tail;
+	pthread_t threads[0];
+};
+
+static struct pthread_pool_t *pool;
+static long cores;
+
+static void *worker(void *arg)
+{
+	struct task_t *task;
+	while (1) {
+		pthread_mutex_lock(&pool->lock);
+		if (pool->stop) {
+			pthread_mutex_unlock(&pool->lock);
+			break;
+		}
+		while (pool->tasks_head == NULL && !pool->stop)
+			pthread_cond_wait(&pool->cond, &pool->lock);
+		if (pool->stop) {
+			pthread_mutex_unlock(&pool->lock);
+			break;
+		}
+		task = pool->tasks_head;
+		pool->tasks_head = task->next;
+		if (!pool->tasks_head)
+			pool->tasks_tail = NULL;
+		pthread_mutex_unlock(&pool->lock);
+		task->func(task->arg);
+		free(task);
+	}
+	return NULL;
+}
+
+static void pthread_pool_create()
+{
+	int i;
+	cores = sysconf(_SC_NPROCESSORS_ONLN) - 1;
+	if (cores <= 0) cores = 8;
+	pool = malloc(sizeof *pool + sizeof(pthread_t) * cores);
+	pool->stop = 0;
+	pthread_mutex_init(&pool->lock, NULL);;
+	pthread_cond_init(&pool->cond, NULL);;
+	pool->tasks_head = NULL;
+	pool->tasks_tail = NULL;
+	for (i = 0; i < cores; ++i)
+		pthread_create(&pool->threads[i], NULL, worker, NULL);
+}
+
+void task_commit(void *arg, void (*f)(handle_t))
+{
+	struct task_t *task;
+	task = malloc(sizeof *task);
+	task->arg = arg;
+	task->func = f;
+	task->next = NULL;
+	pthread_mutex_lock(&pool->lock);
+	if (pool->tasks_head == NULL)
+		pool->tasks_head = pool->tasks_tail = task;
+	else {
+		pool->tasks_tail->next = task;
+		pool->tasks_tail = task;
+	}
+	pthread_cond_signal(&pool->cond);
+	pthread_mutex_unlock(&pool->lock);
+}
+
+static void pthread_pool_destroy()
+{
+	int i;
+	struct task_t *task, *tmp;
+	pthread_mutex_lock(&pool->lock);
+	pool->stop = 1;
+	pthread_cond_broadcast(&pool->cond);
+	pthread_mutex_unlock(&pool->lock);
+	for (i = 0; i < cores; ++i)
+		pthread_join(pool->threads[i], NULL);
+	for (task = pool->tasks_head; task;) {
+		tmp = task;
+		task = task->next; 
+		free(tmp);
+	}
+	free(pool);
+	pool = NULL;
+}
+
+static pthread_mutex_t freelist_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *freelist, *head, *tail;
+static pthread_t master;
+static int workstop;
+
+static void _rpc_alloc(handle_t handle)
+{
+	void *ptr;
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	pthread_mutex_lock(&freelist_lock);
+	ptr = freelist;
+	if (freelist)
+		freelist = *(void **)freelist;
+	pthread_mutex_unlock(&freelist_lock);
+	rpc_push_value(s, (void *)((uintptr_t)ptr - (uintptr_t)head));
+	rpc_server_return(handle);
+}
+
+void rpc_server_return(handle_t handle)
+{
+	((struct _rpc_stack *)handle)->state = RPC_STACK_STATE_RETURN;
+	// msync((void *)handle, sizeof(struct _rpc_stack), MS_ASYNC);
+}
+
+static void _rpc_free(handle_t handle)
+{
+	void *ptr;
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	rpc_pop_value(s, &ptr);
+	ptr = (void *)((uintptr_t)ptr + (uintptr_t)head);
+	pthread_mutex_lock(&freelist_lock);
+	*(void **)ptr = freelist;
+	freelist = ptr;
+	pthread_mutex_unlock(&freelist_lock);
+	rpc_server_return(handle);
+}
+
+static void *coordinate(void *f_handler)
+{
+	void *queue_ptr;
+	struct _rpc_stack *s;
+	pthread_pool_create();
+	for (;;) {
+		for (queue_ptr = head;
+		     queue_ptr < tail;
+		     queue_ptr = (void *)((uintptr_t)queue_ptr + sizeof(struct _rpc_stack))) {
+			if (workstop)
+				goto end;
+			s = (struct _rpc_stack *)queue_ptr;
+			switch (s->state) {
+			case RPC_STACK_STATE_IDLE:
+				break;
+			case RPC_STACK_STATE_CALL:
+				s->state = RPC_STACK_STATE_PROCESS;
+				task_commit((void *)s, f_handler); 
+				break;
+			case RPC_STACK_STATE_ALLOC:
+				s->state = RPC_STACK_STATE_PROCESS;
+				task_commit((void *)s, _rpc_alloc); 
+				break;
+			case RPC_STACK_STATE_FREE:
+				s->state = RPC_STACK_STATE_PROCESS;
+				task_commit((void *)s, _rpc_free); 
+				break;
+			}
+		}
+	}
+end:
+	pthread_pool_destroy();
+	return NULL;
+}
+
+handle_t rpc_server_init(const char *shm_name, void (*f_handler)(handle_t))
+{
+	int fd;
+	struct _rpc_stack *ptr;
+	void *start, *end;
+	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+	ftruncate(fd, RPC_MEMO_SIZE);
+	if (fd < 0)
+		return NULL;
+	ptr = (struct _rpc_stack *)mmap(NULL, RPC_MEMO_SIZE, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0);
+	close(fd);
+	if (ptr == MAP_FAILED)
+		return NULL;
+	freelist = NULL;
+	head = ptr;
+	start = (void *)((uintptr_t)ptr + RPC_STACKS_SIZE);
+	end = (void *)((uintptr_t)ptr + RPC_MEMO_SIZE);
+	for (; (void *)(ptr + 1) <= start; ++ptr) {
+		atomic_init(&ptr->valid, RPC_STACK_VALID_IDLE);
+		ptr->state = RPC_STACK_STATE_IDLE;
+		ptr->top = 0;
+	}
+	tail = (void *)ptr;
+	for (; (void *)((uintptr_t)start + RPC_PAGE_SIZE) <= end; start = (void *)((uintptr_t)start + RPC_PAGE_SIZE)) {
+		*(void **)start = freelist;
+		freelist = start;
+	}
+	workstop = 0;
+	pthread_create(&master, NULL, coordinate, (void *)f_handler);
+	return ptr;
+}
+
+// void rpc_server_run(void *rpc_shared_ptr)
+// {
+// 	void (*fn)(void);
+// 	struct _rpc_stack *stack = (struct _rpc_stack *)rpc_shared_ptr;
+// 	for (;;) {
+// 		while (stack->call_flag && RPC_STACK_STATE_NORMAL(stack)) {
+// 			fn = _rpc_func_getptr(stack->func);
+// 			if (fn) {
+// 				stack->errno = fn();
+// 				RPC_CLEAR_STACK_DATA(stack);
+// 			} else
+// 				stack->state = ERR_FUNCNAME;
+// 			stack->call_flag = 0;
+// 		}
+// 	}
+// }
+
+void rpc_server_destroy(handle_t handle, const char *shm_name)
+{
+	workstop = 1;
+	pthread_join(master, NULL);
+	munmap(((struct _rpc_stack *)handle)->origin_ptr, RPC_MEMO_SIZE);
+	shm_unlink(shm_name);
+}
+
+int rpc_server_push_pointer(handle_t handle, void *v)
+{
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->top >= RPC_STACK_DEFAULT)
+		return 1;
+	else {
+		s->stack[s->top++] = (void *)((uintptr_t)v - (uintptr_t)head);
+		return 0;
+	}
+}
+
+int rpc_server_pop_pointer(handle_t handle, void **v)
+{
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->top <= 0)
+		return 1;
+	else {
+		*v = (void *)((ptrdiff_t)(s->stack[--s->top]) + (uintptr_t)head);
+		return 0;
+	}
+}
+
+#endif /* RPC_SERVER_IMPLEMENT */
 
 #ifdef RPC_CLIENT_IMPLEMENT
 
-#define RPC_CLIENT_PUSH_POINTER(ptr, value)								\
-	do {                                                            				\
-		struct _rpc_stack *stack = (struct _rpc_stack *)(ptr);					\
-		if (stack->top > MAX_ARGS_COUNT)                        				\
-			stack->state = ERR_ARGSNO;                      				\
-		else                                                    				\
-			stack->data[stack->top++] = (void *)((uintptr_t)value - (uintptr_t)ptr);	\
-	} while (0)
-
-#define RPC_CLIENT_PUSH(ptr, value)									\
-	do {                                                            				\
-		struct _rpc_stack *stack = (struct _rpc_stack *)(ptr);					\
-		if (stack->top > MAX_ARGS_COUNT)                        				\
-			stack->state = ERR_ARGSNO;                      				\
-		else                                                    				\
-			stack->data[stack->top++] = (void *)(value);    				\
-	} while (0)
-
-void *rpc_client_init(const char *shm_name)
+handle_t rpc_client_init(const char *shm_name)
 {
 	int fd;
 	void *ptr;
 	fd = shm_open(shm_name, O_RDWR);
 	if (fd < 0)
 		return NULL;
-	ptr = mmap(NULL, RPC_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0);
+	ptr = mmap(NULL, RPC_MEMO_SIZE, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0);
 	close(fd);
-	if (!ptr)
+	if (ptr == MAP_FAILED)
 		return NULL;
-	_rpc_shared_memory_init(ptr);
-	return ptr;
+	for (struct _rpc_stack *s = (struct _rpc_stack *)ptr, *e = (struct _rpc_stack *)((uintptr_t)ptr + RPC_MEMO_SIZE);
+	     s + 1 <=e;
+	     ++s) {
+		if (atomic_exchange(&s->valid, RPC_STACK_VALID_WORK) == RPC_STACK_VALID_IDLE) {
+			s->origin_ptr = ptr;
+			return s;
+		}
+	}
+	munmap(ptr, RPC_MEMO_SIZE);
+	return NULL;
 }
 
-void rpc_client_call(void *rpc_server_ptr)
+void *rpc_alloc_page(handle_t handle)
 {
-	struct _rpc_stack *ptr = (struct _rpc_stack *)(rpc_server_ptr);
-	ptr->call_flag = 1;
-	while (ptr->call_flag)
+	void *ret;
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->state != RPC_STACK_STATE_IDLE)
+		return NULL;
+	s->state = RPC_STACK_STATE_ALLOC;
+	while (s->state != RPC_STACK_STATE_RETURN)
 		;
+	s->state = RPC_STACK_STATE_IDLE;
+	if (rpc_pop_pointer(handle, &ret) != 0)
+		return NULL;
+	return ret;
 }
 
-void rpc_client_destroy(void *rpc_server_ptr)
+int rpc_free(handle_t handle, void *ptr)
 {
-	munmap(rpc_server_ptr, RPC_PAGE_SIZE);
+	void *ret;
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->state != RPC_STACK_STATE_IDLE)
+		return 1;
+	rpc_push_pointer(s, ptr);
+	s->state = RPC_STACK_STATE_FREE;
+	while (s->state != RPC_STACK_STATE_RETURN)
+		;
+	s->state = RPC_STACK_STATE_IDLE;
+	return 0;
+}
+
+void rpc_client_call(handle_t handle)
+{
+	struct _rpc_stack *s;
+	s = (struct _rpc_stack *)handle;
+	if (s->state != RPC_STACK_STATE_IDLE)
+		return;
+	s->state = RPC_STACK_STATE_CALL;
+}
+
+void rpc_client_spin(handle_t handle)
+{
+	while (((struct _rpc_stack *)handle)->state != RPC_STACK_STATE_RETURN)
+		;
+	((struct _rpc_stack *)handle)->state = RPC_STACK_STATE_IDLE;
+}
+
+void rpc_client_wait(handle_t handle)
+{
+	// TODO
+}
+
+void rpc_client_destroy(handle_t handle)
+{
+	munmap(((struct _rpc_stack *)handle)->origin_ptr, RPC_MEMO_SIZE);
 }
 
 #endif /* RPC_CLIENT_IMPLEMENT */
 
-#ifdef RPC_SERVER_IMPLEMENT
-
-#define RPC_CLEAR_STACK_ERROR(stack) (((struct _rpc_stack *)(stack))->state = OK)
-#define RPC_STACK_STATE_NORMAL(stack) (((struct _rpc_stack *)(stack))->state == OK)
-#define RPC_CLEAR_STACK_DATA(stack) (((struct _rpc_stack *)(stack))->top = 0)
-#define RPC_CALL_ARGS0(stack) (((struct _rpc_stack *)(stack))->data[0])
-#define RPC_CALL_ARGS1(stack) (((struct _rpc_stack *)(stack))->data[1])
-#define RPC_CALL_ARGS2(stack) (((struct _rpc_stack *)(stack))->data[2])
-#define RPC_CALL_ARGS3(stack) (((struct _rpc_stack *)(stack))->data[3])
-#define RPC_CALL_ARGS4(stack) (((struct _rpc_stack *)(stack))->data[4])
-#define RPC_CALL_ARGS5(stack) (((struct _rpc_stack *)(stack))->data[5])
-#define RPC_CALL_ARGS6(stack) (((struct _rpc_stack *)(stack))->data[6])
-#define RPC_CALL_PUSH_VALUE(stack, value) (((struct _rpc_stack *)(stack))->data[0] = (void *)(value))
-
-#define RPC_SERVER_POP_POINTER(stack)									\
-	({                                                                              		\
-		 void *ret = NULL;                                                      		\
-		 if ((stack)->top <= 0)                                                 		\
-			 (stack)->state = ERR_ARGSNO;                                   		\
-		 else                                                                   		\
-			 ret = (void *)((ptrdiff_t)((stack)->data[--(stack)->top]) + (ptrdiff_t)stack);	\
-		 ret;											\
-	 })
-
-#define RPC_SERVER_POP(stack)										\
-	({                                                   						\
-		void *ret = NULL;                            						\
-		if ((stack)->top <= 0)                       						\
-			(stack)->state = ERR_ARGSNO;         						\
-		else                                         						\
-			ret = (stack)->data[--(stack)->top];						\
-		ret;                                            					\
-	})
+#ifdef RPC_AUXILIARY_IMPLEMENT
 
 struct rpc_func_unit {
 	const char *func_name;
-	int (*func_ptr)(void);
+	void (*func_ptr)(handle_t);
 	uint32_t func_object;
 };
 
@@ -174,37 +476,24 @@ struct _rpc_funcs {
 	struct rpc_func_unit *funcs;
 };
 
-#define FUNCS_INITIAL_SIZE 8
-
-static struct _rpc_funcs *_rpc_funcs_list;
-
-void *rpc_server_init(const char *shm_name)
+funclist_t rpcL_funclist_init()
 {
-	int fd;
-	struct _rpc_stack *ptr;
-	fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
-	ftruncate(fd, RPC_PAGE_SIZE);
-	if (fd < 0)
-		return NULL;
-	ptr = (struct _rpc_stack *)mmap(NULL, RPC_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0);
-	close(fd);
-	if (ptr == MAP_FAILED)
-		return NULL;
-	ptr->errno = 0;
-	ptr->top = 0;
-	ptr->call_flag = 0;
-	ptr->state = OK;
-	_rpc_shared_memory_init(ptr);
-	return ptr;
+	funclist_t funclist;
+	size_t size = 8;
+	funclist = (funclist_t)malloc(sizeof *funclist);
+	funclist->size = size;
+	funclist->len = 0;
+	funclist->funcs = (struct rpc_func_unit *)malloc(size * sizeof(struct rpc_func_unit));
+	return funclist;
 }
 
-static uint32_t _func_object(const char *func_name)
+static uint32_t _rpcL_get_funcobject(const char *func_name)
 {
 	uint32_t hash;
 	const uint8_t *bytes;
 	uint8_t byte;
-	hash = 0x811c9dc5UL;
 	bytes = (const uint8_t *)func_name;
+	hash = 0x811c9dc5UL;
 	do {
 		byte = *bytes++;
 		if (byte) {
@@ -216,73 +505,47 @@ static uint32_t _func_object(const char *func_name)
 	return hash;
 }
 
-void rpc_server_func_register(const char *func_name, int (*func_ptr)(void))
+void rpcL_funcregister(funclist_t funclist, const char *func_name, void (*func_ptr)(handle_t))
 {
 	size_t size;
 	uint32_t object;
 	struct rpc_func_unit *unit;
-	if (!_rpc_funcs_list) {
-		_rpc_funcs_list = (struct _rpc_funcs *)malloc(sizeof *_rpc_funcs_list);
-		_rpc_funcs_list->size = FUNCS_INITIAL_SIZE;
-		_rpc_funcs_list->len = 0;
-		_rpc_funcs_list->funcs = (struct rpc_func_unit *)
-			malloc(sizeof(struct rpc_func_unit) * FUNCS_INITIAL_SIZE);
+	if (!funclist)
+		return;
+	if (funclist->len == funclist->size) {
+		funclist->size <<= 1;
+		funclist->funcs = (struct rpc_func_unit *)realloc(funclist->funcs, sizeof *unit * funclist->size);
 	}
-
-	if (_rpc_funcs_list->len == _rpc_funcs_list->size) {
-		_rpc_funcs_list->size <<= 1;
-		_rpc_funcs_list->funcs = (struct rpc_func_unit *)
-			realloc(_rpc_funcs_list->funcs,
-				sizeof(struct rpc_func_unit) * _rpc_funcs_list->size);
-	}
-	object = _func_object(func_name);
-	unit = &_rpc_funcs_list->funcs[_rpc_funcs_list->len++];
+	object = _rpcL_get_funcobject(func_name);
+	unit = &funclist->funcs[funclist->len++];
 	unit->func_name = func_name;
 	unit->func_ptr = func_ptr;
 	unit->func_object = object;
 }
 
-static int (*_rpc_func_getptr(const char *func_name))(void)
+void (*rpcL_get_funcptr(funclist_t funclist, const char *func_name))(handle_t)
 {
 	uint32_t object;
 	struct rpc_func_unit *unit;
-	object = _func_object(func_name);
+	object = _rpcL_get_funcobject(func_name);
 	int i;
-	for (i = 0; i < _rpc_funcs_list->len; ++i) {
-		unit = &_rpc_funcs_list->funcs[i];
+	for (i = 0; i < funclist->len; ++i) {
+		unit = &funclist->funcs[i];
 		if (object == unit->func_object && strcmp(func_name, unit->func_name) == 0)
 			return unit->func_ptr;
 	}
 	return NULL;
 }
 
-void rpc_server_run(void *rpc_shared_ptr)
+void rpcL_funclist_destroy(funclist_t funclist)
 {
-	int (*fn)(void);
-	struct _rpc_stack *stack = (struct _rpc_stack *)rpc_shared_ptr;
-	for (;;) {
-		while (stack->call_flag && RPC_STACK_STATE_NORMAL(stack)) {
-			fn = _rpc_func_getptr((const char *)RPC_SERVER_POP_POINTER(stack));
-			if (fn) {
-				stack->errno = fn();
-				RPC_CLEAR_STACK_DATA(stack);
-			} else
-				stack->state = ERR_FUNCNAME;
-			stack->call_flag = 0;
-		}
+	if (funclist) {
+		free(funclist->funcs);
+		free(funclist);
 	}
 }
 
-void rpc_server_destroy(void *rpc_shared_ptr, const char *shm_name)
-{
-	free(_rpc_funcs_list->funcs);
-	free(_rpc_funcs_list);
-	_rpc_funcs_list = NULL;
-	munmap(rpc_shared_ptr, RPC_PAGE_SIZE);
-	shm_unlink(shm_name);
-}
-
-#endif /* RPC_SERVER_IMPLEMENT */
+#endif /* RPC_AUXILIARY_IMPLEMENT */
 
 #ifdef __cplusplus
 }
