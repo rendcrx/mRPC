@@ -1,3 +1,4 @@
+#define RPC_AUXILIARY_IMPLEMENT
 #define RPC_SERVER_IMPLEMENT
 #include "../rpc.h"
 
@@ -6,14 +7,20 @@
 #include <signal.h>
 #include <stdlib.h>
 
-void *handle;
+handle_t handle;
 
-int add(void)
+void add(handle_t handle)
 {
-	int64_t arg1 = (int64_t)RPC_CALL_ARGS0(handle);
-	int64_t arg2 = (int64_t)RPC_CALL_ARGS1(handle);
-	RPC_CALL_PUSH_VALUE(handle, arg1 + arg2);
-	return 0;
+	struct _rpc_stack *s = (struct _rpc_stack *)handle;
+
+	int arg1;
+	int arg2;
+
+	assert(rpc_pop_value(handle, (void *)&arg2) == 0);
+	assert(rpc_pop_value(handle, (void *)&arg1) == 0);
+
+	int ret = arg1 + arg2;
+	assert(rpc_push_value(handle, (void *)(uintptr_t)(ret)) == 0);
 }
 
 void my_clean_void(void)
@@ -30,12 +37,27 @@ void my_clean(int sig)
 	handle = NULL;
 }
 
+funclist_t funclist;
+
+void doit(handle_t handle)
+{
+	void *ret;
+	assert(rpc_server_pop_pointer(handle, &ret) == 0);
+	void (*f)(handle_t) = rpcL_get_funcptr(funclist, (const char *)ret);
+	assert(f);
+	f(handle);
+	rpc_server_return(handle);
+}
+
 int main(void)
 {
 	signal(SIGINT, my_clean);
 	atexit(my_clean_void);
-	handle = rpc_server_init("/test");
+	funclist = rpcL_funclist_init();
+	rpcL_funcregister(funclist, "add", add);
+	handle = rpc_server_init("/test", doit);
 	assert(handle);
-	rpc_server_func_register("add", add);
-	rpc_server_run(handle);
+
+	/* Do other things or sleep */
+	while (handle) ;
 }
